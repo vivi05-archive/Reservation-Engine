@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inventory Reservation Engine</title>
+<style>
+:root{--bg:#f3f5f9;--card:#fff;--ink:#1b2433;--muted:#667085;--line:#e3e8ef;--blue:#2457d6;--green:#12805c;--red:#c62828;--amber:#b45309}
+*{box-sizing:border-box}
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:var(--bg);color:var(--ink);font-size:14px}
+header{background:#14213d;color:#fff;padding:14px 24px}
+header h1{margin:0;font-size:19px}
+header p{margin:3px 0 0;color:#b9c5de;font-size:12px}
+main{max-width:1180px;margin:18px auto;padding:0 14px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px}
+.full{grid-column:1/-1}
+h2{margin:0 0 10px;font-size:15px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--muted);font-weight:600}
+input,select,button{font:inherit;padding:6px 8px;border:1px solid #cdd5e1;border-radius:5px}
+button{background:var(--blue);color:#fff;border-color:var(--blue);cursor:pointer}
+button.alt{background:#fff;color:var(--blue)}
+button.bad{background:#fff;color:var(--red);border-color:var(--red)}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:8px}
+label{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:3px}
+.badge{padding:2px 8px;border-radius:10px;font-size:12px;font-weight:700}
+.ACTIVE{background:#e6efff;color:var(--blue)}
+.CONFIRMED{background:#ddf3ea;color:var(--green)}
+.CANCELLED{background:#eceff3;color:var(--muted)}
+.EXPIRED{background:#fdecc8;color:var(--amber)}
+.ok{color:var(--green);font-weight:700}
+.no{color:var(--red);font-weight:700}
+.hint{color:var(--muted);font-size:12px;margin:4px 0 0}
+#verdict{margin:8px 0;padding:10px;border-radius:6px;font-weight:700;display:none}
+#verdict.good{background:#ddf3ea;color:var(--green)}
+#verdict.bad{background:#fde7e7;color:var(--red)}
+#log{background:#101826;color:#c7d2e6;font:12px/1.5 Consolas,monospace;padding:10px;border-radius:6px;height:230px;overflow:auto;white-space:pre-wrap}
+#toast{position:fixed;right:16px;bottom:16px;padding:10px 14px;border-radius:6px;color:#fff;display:none;max-width:320px}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Inventory Reservation Engine</h1>
+  <p>Race-condition demo: UNSAFE vs MUTEX (lock) vs CAS (compare-and-swap)</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Inventory</h2>
+    <table id="items"></table>
+    <div class="row" style="margin-top:10px">
+      <label>New item<input id="newName" placeholder="Name"></label>
+      <label>Stock<input id="newStock" type="number" min="0" value="10" style="width:80px"></label>
+      <button onclick="addItem()">Add item</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Reserve an item (held for 60 s)</h2>
+    <div class="row">
+      <label>Item<select id="rItem"></select></label>
+      <label>Qty<input id="rQty" type="number" min="1" value="1" style="width:70px"></label>
+      <label>Customer<input id="rCust" value="guest" style="width:110px"></label>
+      <label>Mode<select id="rMode"><option>MUTEX</option><option>CAS</option><option>UNSAFE</option></select></label>
+      <button onclick="reserve()">Reserve</button>
+    </div>
+    <p class="hint">Confirm to buy, cancel to release, or do nothing and the stock returns automatically when the timer ends.</p>
+  </section>
+
+  <section class="card full">
+    <h2>Reservations</h2>
+    <table id="res"></table>
+  </section>
+
+  <section class="card full">
+    <h2>Simulate concurrent users</h2>
+    <div class="row">
+      <label>Item<select id="sItem"></select></label>
+      <label>Users (threads)<input id="sUsers" type="number" min="1" max="200" value="50" style="width:90px"></label>
+      <label>Qty each<input id="sQty" type="number" min="1" value="1" style="width:70px"></label>
+      <label>Starting stock<input id="sStock" type="number" min="0" value="10" style="width:90px"></label>
+      <label>Mode<select id="sMode"><option>UNSAFE</option><option>MUTEX</option><option>CAS</option></select></label>
+      <button id="simBtn" onclick="simulate()">Run simulation</button>
+    </div>
+    <p class="hint">All users fire at the same instant. Run UNSAFE first to see overselling, then MUTEX and CAS to see it fixed.</p>
+    <div id="verdict"></div>
+    <table id="runs"></table>
+  </section>
+
+  <section class="card full">
+    <div class="row" style="justify-content:space-between;margin:0 0 8px">
+      <h2 style="margin:0">Activity log (newest first)</h2>
+      <button class="alt" onclick="clearLog()">Clear log</button>
+    </div>
+    <div id="log"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const runs = [];            // history of simulation results
+let itemSig = '';
+let busy = false;
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(path, method = 'GET', body) {
+  const res = await fetch('/api' + path, {
+    method,
+    headers: {'Content-Type': 'application/json'},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) throw new Error(data.message || ('Request failed (' + res.status + ')'));
+  return data;
+}
+
+let toastTimer;
+function toast(msg, ok = true) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.background = ok ? '#12805c' : '#c62828';
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.style.display = 'none', 2800);
+}
+
+// ---------- rendering ----------
+function renderItems(items) {
+  $('items').innerHTML = '<tr><th>Item</th><th>Stock</th><th></th></tr>' + items.map(i =>
+    `<tr><td>${esc(i.name)}</td><td><b>${i.stock}</b></td>
+     <td><button class="alt" onclick="restock(${i.id})">+ Restock</button></td></tr>`).join('');
+
+  const sig = items.map(i => i.id + ':' + i.name).join('|');
+  if (sig !== itemSig) {                       // rebuild dropdowns only when the item list changes
+    itemSig = sig;
+    const opts = items.map(i => `<option value="${i.id}">${esc(i.name)}</option>`).join('');
+    const r = $('rItem').value, s = $('sItem').value;
+    $('rItem').innerHTML = opts;
+    $('sItem').innerHTML = opts;
+    if (r) $('rItem').value = r;
+    if (s) $('sItem').value = s;
+  }
+}
+
+function renderReservations(list) {
+  if (!list.length) { $('res').innerHTML = '<tr><td class="hint">No reservations yet.</td></tr>'; return; }
+  $('res').innerHTML = '<tr><th>#</th><th>Item</th><th>Customer</th><th>Qty</th><th>Status</th><th>Time left</th><th>Created</th><th></th></tr>' +
+    list.map(r => {
+      const active = r.status === 'ACTIVE';
+      return `<tr><td>${r.id}</td><td>${esc(r.itemName)}</td><td>${esc(r.customer)}</td><td>${r.quantity}</td>
+        <td><span class="badge ${r.status}">${r.status}</span></td>
+        <td>${active ? r.secondsLeft + ' s' : '-'}</td><td>${esc(r.createdAt)}</td>
+        <td>${active ? `<button onclick="confirmRes(${r.id})">Confirm</button> <button class="bad" onclick="cancelRes(${r.id})">Cancel</button>` : ''}</td></tr>`;
+    }).join('');
+}
+
+function renderRuns() {
+  if (!runs.length) { $('runs').innerHTML = ''; return; }
+  $('runs').innerHTML = '<tr><th>Mode</th><th>Users</th><th>Start stock</th><th>Sold</th><th>Oversold</th><th>Final stock</th><th>Expected</th><th>Attempts</th><th>Time</th><th>Result</th></tr>' +
+    runs.map(r => `<tr><td><b>${r.mode}</b></td><td>${r.users}</td><td>${r.initialStock}</td><td>${r.unitsSold}</td>
+      <td class="${r.oversold ? 'no' : ''}">${r.oversold}</td><td>${r.finalStock}</td><td>${r.expectedStock}</td>
+      <td>${r.totalAttempts}</td><td>${r.durationMs} ms</td>
+      <td class="${r.consistent ? 'ok' : 'no'}">${r.consistent ? 'CORRECT' : 'RACE'}</td></tr>`).join('');
+}
+
+// ---------- actions ----------
+async function refresh() {
+  if (busy) return;
+  busy = true;
+  try {
+    const [items, res, log] = await Promise.all([api('/items'), api('/reservations'), api('/log')]);
+    renderItems(items);
+    renderReservations(res);
+    const box = $('log');
+    const atTop = box.scrollTop < 5;
+    box.textContent = log.join('\n');
+    if (atTop) box.scrollTop = 0;
+  } catch (e) { /* server may be restarting; try again next tick */ }
+  busy = false;
+}
+
+async function addItem() {
+  try {
+    await api('/items', 'POST', {name: $('newName').value, stock: +$('newStock').value});
+    $('newName').value = '';
+    toast('Item added');
+  } catch (e) { toast(e.message, false); }
+  refresh();
+}
+
+async function restock(id) {
+  const q = prompt('Add how many units?', '5');
+  if (!q) return;
+  try { await api('/items/' + id + '/restock', 'POST', {quantity: +q}); toast('Restocked'); }
+  catch (e) { toast(e.message, false); }
+  refresh();
+}
+
+async function reserve() {
+  try {
+    const r = await api('/reservations', 'POST', {
+      itemId: +$('rItem').value, quantity: +$('rQty').value,
+      customer: $('rCust').value, mode: $('rMode').value
+    });
+    toast('Reserved #' + r.id);
+  } catch (e) { toast(e.message, false); }
+  refresh();
+}
+
+async function confirmRes(id) {
+  try { await api('/reservations/' + id + '/confirm', 'POST'); toast('Confirmed #' + id); }
+  catch (e) { toast(e.message, false); }
+  refresh();
+}
+
+async function cancelRes(id) {
+  try { await api('/reservations/' + id + '/cancel', 'POST'); toast('Cancelled #' + id); }
+  catch (e) { toast(e.message, false); }
+  refresh();
+}
+
+async function simulate() {
+  const btn = $('simBtn');
+  btn.disabled = true; btn.textContent = 'Running...';
+  try {
+    const r = await api('/simulate', 'POST', {
+      itemId: +$('sItem').value, users: +$('sUsers').value, quantity: +$('sQty').value,
+      stock: +$('sStock').value, mode: $('sMode').value
+    });
+    runs.unshift(r);
+    const v = $('verdict');
+    v.style.display = 'block';
+    v.className = r.consistent ? 'good' : 'bad';
+    v.textContent = r.mode + ': ' + r.verdict;
+    renderRuns();
+  } catch (e) { toast(e.message, false); }
+  btn.disabled = false; btn.textContent = 'Run simulation';
+  refresh();
+}
+
+async function clearLog() { await api('/log', 'DELETE'); refresh(); }
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
